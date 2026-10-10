@@ -1,0 +1,727 @@
+diff --git a/checkers/cchk.c b/checkers/cchk.c
+index 7367522..3532dcf 100644
+--- a/checkers/cchk.c
++++ b/checkers/cchk.c
+@@ -254,6 +254,7 @@ static i64 hyp[MAXH];              /* h_j, the hypotenuse of the triple of hallw
+ static i64 F[MAXH][3], G[MAXH][3]; /* h_j f_j = F[j][0] + F[j][1] x + F[j][2] y, and h_j g_j likewise */
+ static i64 Wn, Wd, Tn, Td;         /* W = Wn/Wd, T = Tn/Td */
+ static int Dk;                     /* the largest number of splits of one coordinate on a path */
++static int nsub = 0; /* sub-slabs of the telescoping bound (spec key "nsub"); 0 disables it */
+ static i64 M, MW, L;               /* the scale M, M W, and the lcm L of the determinants */
+ static i64 Mh[MAXH], MF0[MAXH], MG0[MAXH]; /* M h_j, M F[j][0], M G[j][0] */
+ static i64 root_lo[MAXC], root_hi[MAXC];   /* E_0, coordinate 2j + i scaled by M h_j */
+@@ -415,6 +416,7 @@ typedef struct {
+     Poly t1, t2; /* for meets */
+     int parent[1 << MAXH];
+     i256 comp[1 << MAXH];
++    void *w2; /* Work2 of the telescoping bound */
+ } Work;
+ 
+ /* the boundary lines of the leaf box [lo, hi] (all multiplied by M h_j) */
+@@ -546,6 +548,206 @@ static int check_leaf(Work *w, const i64 *lo, const i64 *hi, i256 *value, int *u
+     return at_most_T(best);
+ }
+ 
++static inline i64 midpoint(i64 a, i64 b);
++/* ---------------------------------------------------------------- the telescoping bound
++
++ A second test for a leaf box E (not in the paper). For w in E let A(w) = area(B_W cap X(w)); then
++ lambda*(B_W cap X(w)) <= A(w). Move from the centre c of E to w one coordinate at a time; every
++ intermediate point lies in E. When coordinate u1 of hallway j moves from its centre value m by t (0 <= t <= h,
++ h the half-width, h <= 1), the area gained lies in U cap S_gain(t) and the area lost contains
++ C_j cap S_loss(t), where
++   U   = B_W cap Xhat(E)                               (contains X(w') for every w' in E)
++   C_j = B_W cap (cores of the hallways i != j)        (core = points in X_i(u) for every u in the box)
++ and, with a, b, c, d the interval ends of hallway j and m, m2 the midpoints,
++   u1 up:    S_gain = {m+1 < f <= m+1+t},                 S_loss = {m <= f < m+t, g <= c}
++   u1 down:  S_gain = {m-t <= f < m} minus {d <= g <= c+1}, S_loss = {m+1-t < f <= m+1, g <= c+1}
++   u2 up:    S_gain = {m2+1 < g <= m2+1+t},               S_loss = {m2 <= g < m2+t, f <= a}
++   u2 down:  S_gain = {m2-t <= g < m2} minus {b <= f <= a+1}, S_loss = {m2+1-t < g <= m2+1, f <= a+1}
++ (the core of X_j over E is {g <= c+1, f <= a+1, (f >= b or g >= d)}). For t in [t_k, t_{k+1}],
++ t_k = k h / n, the change is at most gain(t_{k+1}) - loss(t_k). Summing the largest such value over the
++ coordinates and both directions bounds A(w) - A(c). The leaf passes if A(c) + this sum <= T.
++*/
++
++#define MAXQ 512
++#define LN_UNI 4
++#define LN_CORE (4 + 5 * MAXH)
++#define LN_CEN (4 + 10 * MAXH)
++#define LN_EXTRA (4 + 15 * MAXH)
++#define NLINE2 (LN_EXTRA + 8)
++
++typedef struct {
++    int n;
++    Poly p[MAXQ];
++} PolyList;
++
++typedef struct {
++    Line ln[NLINE2];
++    PolyList U, C, Ctr, S;
++    Poly bufA[MAXH + 1], bufB[MAXH + 1], bufC[MAXH + 1], t1, t2;
++} Work2;
++
++/* line idx: h_j-scaled function (isg ? g_j : f_j) compared with V (scaled by M h_j): le ? <= : >= */
++static void set_fn_line(Work2 *w, int idx, int j, int isg, int le, i64 V) {
++    const i64 *H = isg ? G[j] : F[j];
++    i64 H0 = isg ? MG0[j] : MF0[j];
++    if (le)
++        set_line(&w->ln[idx], H[1], H[2], to64(sub128(i128_from(V), i128_from(H0))), isg ? dir_g[j] : dir_f[j]);
++    else
++        set_line(&w->ln[idx], -H[1], -H[2], to64(sub128(i128_from(H0), i128_from(V))),
++                 isg ? dir_gneg[j] : dir_fneg[j]);
++}
++
++/* lines of the shape {g <= gd+1, f <= fb+1, (f >= fa or (f <= fa and g >= gc))} of hallway j at base */
++static void set_shape_lines(Work2 *w, int base, int j, i64 fa, i64 fb, i64 gc, i64 gd) {
++    int l = base + 5 * j;
++    set_fn_line(w, l + 0, j, 1, 1, gd + Mh[j]);
++    set_fn_line(w, l + 1, j, 0, 1, fb + Mh[j]);
++    set_fn_line(w, l + 2, j, 0, 0, fa);
++    set_fn_line(w, l + 3, j, 0, 1, fa);
++    set_fn_line(w, l + 4, j, 1, 0, gc);
++}
++
++static void shape_rec(Work2 *w, int base, int skip, int j, const Poly *P, PolyList *out) {
++    Poly *A, *B, *Cc;
++    int l = base + 5 * j;
++    if (j == skip) {
++        shape_rec(w, base, skip, j + 1, P, out);
++        return;
++    }
++    if (j == nhall) {
++        if (P->n < 3) return; /* no area */
++        if (out->n >= MAXQ) die("MAXQ");
++        copy_poly(&out->p[out->n++], P);
++        return;
++    }
++    A = &w->bufA[j];
++    B = &w->bufB[j];
++    Cc = &w->bufC[j];
++    clip(P, w->ln, l + 0, A);
++    if (!A->n) return;
++    clip(A, w->ln, l + 1, B);
++    if (!B->n) return;
++    clip(B, w->ln, l + 2, A);
++    if (A->n) shape_rec(w, base, skip, j + 1, A, out);
++    clip(B, w->ln, l + 3, Cc);
++    if (Cc->n) {
++        clip(Cc, w->ln, l + 4, A);
++        if (A->n) shape_rec(w, base, skip, j + 1, A, out);
++    }
++}
++
++static void build_shape(Work2 *w, int base, int skip, PolyList *out) {
++    out->n = 0;
++    shape_rec(w, base, skip, 0, &rect, out);
++}
++
++static i256 list_area(const PolyList *L) {
++    i256 s = zero256();
++    for (int i = 0; i < L->n; i++) s = add256(s, twice_area(&L->p[i]));
++    return s;
++}
++
++/* out[k] = area of L cap (extra lines) cap slab, for k = 0..nsub; the slab is between the value s0 and
++   s0 + sgn t_k of the function (isg ? g_j : f_j), with t_k = k hw / nsub (hw = the half-width, scaled) */
++static void cum_areas(Work2 *w, const PolyList *L, int j, int isg, i64 s0, int sgn, i64 hw, const int *extra,
++                      int nextra, i256 *out) {
++    int lo_idx = LN_EXTRA + 4, hi_idx = LN_EXTRA + 5, cut_idx = LN_EXTRA + 6;
++    i64 step = hw / nsub, far = sgn > 0 ? s0 + hw : s0 - hw;
++    PolyList *S = &w->S;
++    if (step * nsub != hw) die("sub-slab not exact at chosen scale");
++    set_fn_line(w, lo_idx, j, isg, 0, sgn > 0 ? s0 : far); /* >= lower end */
++    set_fn_line(w, hi_idx, j, isg, 1, sgn > 0 ? far : s0); /* <= upper end */
++    S->n = 0;
++    for (int i = 0; i < L->n; i++) {
++        Poly *a = &w->t1, *b = &w->t2, *t;
++        clip(&L->p[i], w->ln, lo_idx, a);
++        if (a->n < 3) continue;
++        clip(a, w->ln, hi_idx, b);
++        if (b->n < 3) continue;
++        t = a; a = b; b = t;
++        for (int e = 0; e < nextra && a->n >= 3; e++) {
++            clip(a, w->ln, extra[e], b);
++            t = a; a = b; b = t;
++        }
++        if (a->n < 3) continue;
++        copy_poly(&S->p[S->n++], a);
++    }
++    out[0] = zero256();
++    for (int k = 1; k <= nsub; k++) {
++        i256 s = zero256();
++        if (k == nsub) {
++            s = list_area(S);
++        } else {
++            i64 edge = s0 + sgn * step * k;
++            set_fn_line(w, cut_idx, j, isg, sgn > 0, edge); /* sgn > 0: <= edge; else >= edge */
++            for (int i = 0; i < S->n; i++) {
++                clip(&S->p[i], w->ln, cut_idx, &w->t1);
++                if (w->t1.n >= 3) s = add256(s, twice_area(&w->t1));
++            }
++        }
++        out[k] = s;
++    }
++}
++
++#define work2_of(work) ((Work2 *)(work)->w2)
++static int check_leaf_b2(Work2 *w, const i64 *lo, const i64 *hi, i256 *value) {
++    i256 total;
++    memcpy(w->ln, rect_line, sizeof(rect_line));
++    for (int j = 0; j < nhall; j++) {
++        i64 a = lo[2 * j], b = hi[2 * j], c = lo[2 * j + 1], d = hi[2 * j + 1];
++        i64 m1 = midpoint(a, b), m2 = midpoint(c, d);
++        if (b - a > 2 * Mh[j] || d - c > 2 * Mh[j]) return 0; /* the argument needs h <= 1 */
++        set_shape_lines(w, LN_UNI, j, a, b, c, d);
++        set_shape_lines(w, LN_CORE, j, b, a, d, c);
++        set_shape_lines(w, LN_CEN, j, m1, m1, m2, m2);
++    }
++    build_shape(w, LN_CEN, -1, &w->Ctr);
++    total = list_area(&w->Ctr);
++    build_shape(w, LN_UNI, -1, &w->U);
++    for (int j = 0; j < nhall; j++) {
++        i64 a = lo[2 * j], b = hi[2 * j], c = lo[2 * j + 1], d = hi[2 * j + 1];
++        build_shape(w, LN_CORE, j, &w->C);
++        for (int coord = 0; coord < 2; coord++) {
++            int isg = coord, other = !coord;
++            i64 m = coord == 0 ? midpoint(a, b) : midpoint(c, d);
++            i64 hw = coord == 0 ? (b - a) / 2 : (d - c) / 2;
++            i256 best = zero256(), gain[65], loss[65], part[65];
++            int ex[1];
++            if (hw <= 0) continue;
++            for (int dir = 0; dir < 2; dir++) {
++                if (dir == 0) {
++                    cum_areas(w, &w->U, j, isg, m + Mh[j], 1, hw, ex, 0, gain);
++                    set_fn_line(w, LN_EXTRA + 0, j, other, 1, coord == 0 ? c : a);
++                    ex[0] = LN_EXTRA + 0;
++                    cum_areas(w, &w->C, j, isg, m, 1, hw, ex, 1, loss);
++                } else {
++                    i64 lo_cut = coord == 0 ? d : b, hi_cut = (coord == 0 ? c : a) + Mh[j];
++                    if (lo_cut < hi_cut) {
++                        set_fn_line(w, LN_EXTRA + 0, j, other, 1, lo_cut);
++                        ex[0] = LN_EXTRA + 0;
++                        cum_areas(w, &w->U, j, isg, m, -1, hw, ex, 1, gain);
++                        set_fn_line(w, LN_EXTRA + 0, j, other, 0, hi_cut);
++                        cum_areas(w, &w->U, j, isg, m, -1, hw, ex, 1, part);
++                        for (int k = 0; k <= nsub; k++) gain[k] = add256(gain[k], part[k]);
++                    } else {
++                        cum_areas(w, &w->U, j, isg, m, -1, hw, ex, 0, gain);
++                    }
++                    set_fn_line(w, LN_EXTRA + 0, j, other, 1, (coord == 0 ? c : a) + Mh[j]);
++                    ex[0] = LN_EXTRA + 0;
++                    cum_areas(w, &w->C, j, isg, m + Mh[j], -1, hw, ex, 1, loss);
++                }
++                for (int k = 0; k < nsub; k++) {
++                    i256 dlt = sub256(gain[k + 1], loss[k]);
++                    if (cmp256(dlt, best) > 0) best = dlt;
++                }
++            }
++            total = add256(total, best);
++        }
++    }
++    *value = total;
++    return at_most_T(total);
++}
++
+ /* ---------------------------------------------------------------- the spec file */
+ 
+ static char *read_file(const char *path, size_t *len) {
+@@ -684,6 +886,12 @@ static void read_spec(const char *spec_path, char *cert_path) {
+     parse_fraction(json_string(js, "W", buf, sizeof buf), &Wn, &Wd);
+     parse_fraction(json_string(js, "T", buf, sizeof buf), &Tn, &Td);
+     json_string(js, "cert", cert_path, 1024);
++    if (strstr(js, "\"nsub\"")) {
++        i64 nn, nd;
++        parse_fraction(json_string(js, "nsub", buf, sizeof buf), &nn, &nd);
++        if (nd != 1 || nn < 1 || nn > 64) die("nsub must be an integer in 1..64");
++        nsub = (int)nn;
++    }
+     free(js);
+     if (nhall < 1) die("no hallways");
+     if (lt128(mul64x64(Wn, Wmin_d), mul64x64(Wmin_n, Wd))) die("W < min_a W_a (Lemma 5.1)");
+@@ -805,8 +1013,10 @@ static void check_structure(void) {
+ static void setup_scale(void) {
+     i64 X[4], Y[4];
+     if (Dk > 40) die("per-coordinate depth too large for this scale choice");
+-    M = to64(mul64x64(Wd, (i64)1 << Dk));
+-    MW = to64(mul64x64(Wn, (i64)1 << Dk));
++    /* with the telescoping bound, the scale has an extra factor 2 nsub, so that midpoints m of leaf
++       intervals and the points m +- (b - a) k / (2 nsub) are integers too */
++    M = to64(mul64x64(to64(mul64x64(Wd, (i64)1 << Dk)), nsub ? 2 * nsub : 1));
++    MW = to64(mul64x64(to64(mul64x64(Wn, (i64)1 << Dk)), nsub ? 2 * nsub : 1));
+     for (int j = 0; j < nhall; j++) {
+         Mh[j] = to64(mul64x64(M, hyp[j]));
+         MF0[j] = to64(mul64x64(M, F[j][0]));
+@@ -957,7 +1167,7 @@ static void make_tasks(int cut) {
+ }
+ 
+ typedef struct {
+-    i64 leaves, with_components, exceeding;
++    i64 leaves, with_components, exceeding, with_b2;
+     i256 worst;
+     i64 first_bad; /* the token of the first leaf exceeding T, or -1 */
+     double first_bad_value;
+@@ -971,6 +1181,14 @@ static void check_task(const Task *task, Work *work, Stats *s) {
+         int used_components, ok;
+         while (tokens[w.i] >= 0) descend(&w);
+         ok = check_leaf(work, w.lo, w.hi, &value, &used_components);
++        if (!ok && nsub) {
++            i256 v2;
++            if (check_leaf_b2(work2_of(work), w.lo, w.hi, &v2)) {
++                ok = 1;
++                value = v2;
++                s->with_b2++;
++            }
++        }
+         s->leaves++;
+         s->with_components += used_components;
+         if (cmp256(value, s->worst) > 0) s->worst = value;
+@@ -1026,6 +1244,8 @@ int main(int argc, char **argv) {
+         work[t] = calloc(1, sizeof(Work));
+         if (!work[t]) die("malloc work");
+         work[t]->piece = malloc(sizeof(Piece) << nhall);
++        work[t]->w2 = calloc(1, sizeof(Work2));
++        if (!work[t]->w2) die("malloc work2");
+         if (!work[t]->piece) die("malloc work");
+         per_thread[t].worst = zero256();
+         per_thread[t].first_bad = -1;
+@@ -1045,6 +1265,7 @@ int main(int argc, char **argv) {
+         const Stats *s = &per_thread[t];
+         total.leaves += s->leaves;
+         total.with_components += s->with_components;
++        total.with_b2 += s->with_b2;
+         total.exceeding += s->exceeding;
+         if (cmp256(s->worst, total.worst) > 0) total.worst = s->worst;
+         if (s->first_bad >= 0 && (total.first_bad < 0 || s->first_bad < total.first_bad)) {
+@@ -1058,6 +1279,7 @@ int main(int argc, char **argv) {
+            (long long)total.leaves, (long long)nleaves, to_double(total.worst) / area_scale,
+            (long long)total.exceeding, (long long)total.with_components, omp_get_wtime() - t0,
+            (double)(clock() - c0) / CLOCKS_PER_SEC);
++    printf("telescoping bound: nsub=%d, leaves certified by it: %lld\n", nsub, (long long)total.with_b2);
+     if (total.exceeding)
+         printf("first failing leaf at token %lld, value %.10f > T\n", (long long)total.first_bad,
+                total.first_bad_value);
+diff --git a/search/csearch.c b/search/csearch.c
+index b3f1144..797fd8b 100644
+--- a/search/csearch.c
++++ b/search/csearch.c
+@@ -53,6 +53,7 @@ typedef struct {
+ 
+ typedef struct {
+     double lo[2 * MAXK], hi[2 * MAXK];
++    double val; /* Gamma of the box if already known (from the lookahead of its parent), else -1 */
+     int depth;
+ } Box;
+ 
+@@ -71,6 +72,10 @@ static Box root;
+ 
+ /* the options */
+ static int centre_depth = 1000;
++static int split_mode = 0;
++static int use_b2 = 0;   /* 1: also try the telescoping (gain - guaranteed loss) bound on the total area */
++static int nsub = 8; static double b2_gate = 0.03;    /* sub-slabs in the telescoping bound */  /* 0: widest coordinate; 1: lookahead over all coordinates */
++static double min_ratio = 0; /* lookahead considers only coordinates at least this fraction of the widest */
+ static long long max_nodes = 4000000000LL;
+ 
+ static Piece window; /* the rectangle B_W = [0, W] x [0, 1] */
+@@ -265,15 +270,167 @@ static int widest(const Box *b) {
+ static void bisect(const Box *b, int k, Box *lower, Box *upper) {
+     double m = 0.5 * (b->lo[k] + b->hi[k]);
+     *lower = *upper = *b;
++    lower->val = upper->val = -1;
+     lower->hi[k] = upper->lo[k] = m;
+     lower->depth = upper->depth = b->depth + 1;
+ }
+ 
+-/* LEAF if the box is a leaf, otherwise the coordinate to bisect; *value gets Gamma of the box */
+-static int evaluate(const Box *b, Workspace *ws, double *value) {
++
++/* ---- telescoping bound on the total area of B_W cap X(w) over a box ----
++   A hallway shape with parameters (fa, fb, gc, gd) is the set {g <= gd+1, f <= fb+1, (f >= fa or g >= gc)}.
++   The union over the box is (a, b, c, d); the core (points in X_j(u) for every u in the box) is (b, a, d, c). */
++#define MAXQ 1024
++typedef struct { Poly p[MAXQ]; int n; } PolyList;
++typedef struct { PolyList L[3]; } Work2;
++static Work2 *work2[MAXTHREADS];
++
++static void shape_pieces(const double prm[][4], int skip, PolyList *out, PolyList *tmp) {
++    PolyList *cur = out, *nxt = tmp, *sw;
++    cur->n = 1;
++    cur->p[0] = window.poly;
++    for (int j = 0; j < K && cur->n > 0; j++) {
++        if (j == skip) continue;
++        double fa = prm[j][0], fb = prm[j][1], gc = prm[j][2], gd = prm[j][3];
++        HalfPlane h0 = at_most(G[j], gd + 1), h1 = at_most(F[j], fb + 1), h2 = at_least(F[j], fa),
++                  h3 = at_most(F[j], fa), h4 = at_least(G[j], gc);
++        nxt->n = 0;
++        for (int i = 0; i < cur->n; i++) {
++            Poly t1, t2, p, q;
++            if (!clip(&cur->p[i], &t1, h0) || !clip(&t1, &t2, h1)) continue;
++            if (clip(&t2, &p, h2) && area(&p) > 0) { if (nxt->n >= MAXQ) die("MAXQ"); nxt->p[nxt->n++] = p; }
++            if (clip(&t2, &q, h3) && clip(&q, &p, h4) && area(&p) > 0) { if (nxt->n >= MAXQ) die("MAXQ"); nxt->p[nxt->n++] = p; }
++        }
++        sw = cur; cur = nxt; nxt = sw;
++    }
++    if (cur != out) *out = *cur;
++}
++
++/* area of the pieces cut by up to three half-planes */
++static double area_cut(const PolyList *L, const HalfPlane *h, int nh) {
++    double s = 0;
++    for (int i = 0; i < L->n; i++) {
++        Poly a = L->p[i], b;
++        int ok = 1;
++        for (int t = 0; t < nh && ok; t++) {
++            ok = clip(&a, &b, h[t]) >= 3;
++            a = b;
++        }
++        if (ok) s += area(&a);
++    }
++    return s;
++}
++
++/* the slab lo <= h <= hi of the affine function h, as two half-planes */
++static void slab(const double *h, double lo, double hi, HalfPlane *out) {
++    out[0] = at_least(h, lo);
++    out[1] = at_most(h, hi);
++}
++
++/* out[k] = area of L cap extra cap {P between s0 and s0 + sgn * t_k}, t_k = h k / n, for k = 0..n */
++static void cum_areas(const PolyList *L, const double *P, double s0, int sgn, double h, int n, const HalfPlane *extra,
++                      int nextra, double *out, PolyList *tmp) {
++    HalfPlane hp[2];
++    double lo = sgn > 0 ? s0 : s0 - h, hi = sgn > 0 ? s0 + h : s0;
++    tmp->n = 0;
++    slab(P, lo, hi, hp);
++    for (int i = 0; i < L->n; i++) {
++        Poly a = L->p[i], b;
++        int ok = clip(&a, &b, hp[0]) >= 3;
++        if (ok) { a = b; ok = clip(&a, &b, hp[1]) >= 3; a = b; }
++        for (int t = 0; t < nextra && ok; t++) { ok = clip(&a, &b, extra[t]) >= 3; a = b; }
++        if (ok) tmp->p[tmp->n++] = a;
++    }
++    out[0] = 0;
++    for (int k = 1; k <= n; k++) {
++        double edge = s0 + sgn * h * k / n, s = 0;
++        HalfPlane cut = sgn > 0 ? at_most(P, edge) : at_least(P, edge);
++        if (k == n) {
++            for (int i = 0; i < tmp->n; i++) s += area(&tmp->p[i]);
++        } else {
++            for (int i = 0; i < tmp->n; i++) {
++                Poly b;
++                if (clip(&tmp->p[i], &b, cut) >= 3) s += area(&b);
++            }
++        }
++        out[k] = s;
++    }
++}
++
++static double bound2(const double *lo, const double *hi, Work2 *w2) {
++    double uni[MAXK][4], core[MAXK][4], cen[MAXK][4], total;
++    PolyList *U = &w2->L[0], *C = &w2->L[1], *tmp = &w2->L[2];
++    for (int j = 0; j < K; j++) {
++        double a = lo[2 * j], b = hi[2 * j], c = lo[2 * j + 1], d = hi[2 * j + 1];
++        double m1 = 0.5 * (a + b), m2 = 0.5 * (c + d);
++        if (b - a > 2 || d - c > 2) return 1e300;
++        uni[j][0] = a; uni[j][1] = b; uni[j][2] = c; uni[j][3] = d;
++        core[j][0] = b; core[j][1] = a; core[j][2] = d; core[j][3] = c;
++        cen[j][0] = cen[j][1] = m1; cen[j][2] = cen[j][3] = m2;
++    }
++    shape_pieces(cen, -1, U, tmp);
++    total = 0;
++    for (int i = 0; i < U->n; i++) total += area(&U->p[i]);
++    shape_pieces(uni, -1, U, tmp);
++    for (int j = 0; j < K; j++) {
++        double a = lo[2 * j], b = hi[2 * j], c = lo[2 * j + 1], d = hi[2 * j + 1];
++        double m1 = 0.5 * (a + b), m2 = 0.5 * (c + d), h1 = 0.5 * (b - a), h2 = 0.5 * (d - c);
++        shape_pieces(core, j, C, tmp);
++        for (int coord = 0; coord < 2; coord++) {
++            const double *P = coord == 0 ? F[j] : G[j]; /* the moving function */
++            const double *Q = coord == 0 ? G[j] : F[j]; /* the other one */
++            double m = coord == 0 ? m1 : m2, h = coord == 0 ? h1 : h2, best = 0;
++            double gain[65], loss[65], part[65];
++            HalfPlane ex[1];
++            if (h <= 0) continue;
++            for (int dir = 0; dir < 2; dir++) {
++                if (dir == 0) {
++                    /* increase: gain in m+1 < P <= m+1+t; guaranteed loss in m <= P < m+t with
++                       g < c (u1) or f < a (u2) */
++                    cum_areas(U, P, m + 1, 1, h, nsub, ex, 0, gain, tmp);
++                    ex[0] = at_most(Q, coord == 0 ? c : a);
++                    cum_areas(C, P, m, 1, h, nsub, ex, 1, loss, tmp);
++                } else {
++                    /* decrease: gain in m-t <= P < m, without the points that are in the other arm for
++                       every parameter (d <= g <= c+1 for u1, b <= f <= a+1 for u2); guaranteed loss in
++                       m+1-t < P <= m+1 with g <= c+1 (u1) or f <= a+1 (u2) */
++                    double lo_cut = coord == 0 ? d : b, hi_cut = coord == 0 ? c + 1 : a + 1;
++                    if (lo_cut < hi_cut) {
++                        ex[0] = at_most(Q, lo_cut);
++                        cum_areas(U, P, m, -1, h, nsub, ex, 1, gain, tmp);
++                        ex[0] = at_least(Q, hi_cut);
++                        cum_areas(U, P, m, -1, h, nsub, ex, 1, part, tmp);
++                        for (int k = 0; k <= nsub; k++) gain[k] += part[k];
++                    } else {
++                        cum_areas(U, P, m, -1, h, nsub, ex, 0, gain, tmp);
++                    }
++                    ex[0] = at_most(Q, coord == 0 ? c + 1 : a + 1);
++                    cum_areas(C, P, m + 1, -1, h, nsub, ex, 1, loss, tmp);
++                }
++                for (int k = 0; k < nsub; k++)
++                    if (gain[k + 1] - loss[k] > best) best = gain[k + 1] - loss[k];
++            }
++            total += best;
++            if (total > T) return total; /* every term is >= 0: the box cannot pass any more */
++        }
++    }
++    return total;
++}
++
++/* LEAF if the box is a leaf, otherwise the coordinate to bisect; *value gets Gamma of the box.
++   In split mode 1 the coordinate is chosen by evaluating both halves for every candidate coordinate and
++   taking the one whose worse half is smallest; the values of the chosen halves go to vlo, vhi. */
++static int evaluate(const Box *b, Workspace *ws, double *value, double *vlo, double *vhi) {
+     double total;
+-    *value = gamma_box(b->lo, b->hi, &total, ws);
++    *vlo = *vhi = -1;
++    *value = b->val >= 0 ? b->val : gamma_box(b->lo, b->hi, &total, ws);
+     if (*value <= T - margin) return LEAF;
++    if (use_b2 && b->hi[widest(b)] - b->lo[widest(b)] <= 2 * b2_gate) {
++        double v2 = bound2(b->lo, b->hi, work2[omp_get_thread_num()]);
++        if (v2 <= T - margin) {
++            *value = v2;
++            return LEAF;
++        }
++    }
+     if (b->depth <= centre_depth) {
+         double centre[2 * MAXK] = {0}, g;
+         for (int i = 0; i < 2 * K; i++) centre[i] = 0.5 * (b->lo[i] + b->hi[i]);
+@@ -283,6 +440,33 @@ static int evaluate(const Box *b, Workspace *ws, double *value) {
+             fprintf(stderr, "FAIL: Gamma at the centre of a box is %.9f > T\n", g);
+         }
+     }
++    if (split_mode == 1) {
++        int k = widest(b), best = -1;
++        double wmax = b->hi[k] - b->lo[k], bs1 = 1e300, bs2 = 1e300;
++        for (int i = 0; i < 2 * K; i++) {
++            double lo2[2 * MAXK], hi2[2 * MAXK], m, g1, g2, s1, s2;
++            if (b->hi[i] - b->lo[i] < min_ratio * wmax) continue;
++            m = 0.5 * (b->lo[i] + b->hi[i]);
++            memcpy(lo2, b->lo, sizeof(double) * 2 * K);
++            memcpy(hi2, b->hi, sizeof(double) * 2 * K);
++            hi2[i] = m;
++            g1 = gamma_box(lo2, hi2, &total, ws);
++            hi2[i] = b->hi[i];
++            lo2[i] = m;
++            g2 = gamma_box(lo2, hi2, &total, ws);
++            /* primary: number of halves that are not leaves; secondary: the larger value */
++            s1 = (g1 > T - margin) + (g2 > T - margin);
++            s2 = (g1 > g2 ? g1 : g2) + 1e-3 * (g1 < g2 ? g1 : g2);
++            if (s1 < bs1 || (s1 == bs1 && s2 < bs2)) {
++                bs1 = s1;
++                bs2 = s2;
++                best = i;
++                *vlo = g1;
++                *vhi = g2;
++            }
++        }
++        return best;
++    }
+     return widest(b);
+ }
+ 
+@@ -332,10 +516,10 @@ static void search_subtree(const Box *top, Subtree *out, Workspace *ws) {
+     stack[sp++] = *top;
+     while (sp > 0 && !failed) {
+         Box b = stack[--sp];
+-        double value;
++        double value, vlo, vhi;
+         int k;
+         if ((++out->nodes & 0xFFFF) == 0) count_nodes(0x10000);
+-        k = evaluate(&b, ws, &value);
++        k = evaluate(&b, ws, &value, &vlo, &vhi);
+         if (k == LEAF) {
+             push(&out->tokens, LEAF);
+             if (value > out->worst) out->worst = value;
+@@ -343,6 +527,8 @@ static void search_subtree(const Box *top, Subtree *out, Workspace *ws) {
+             push(&out->tokens, k);
+             if (sp + 2 >= STACK) die("stack overflow");
+             bisect(&b, k, &stack[sp + 1], &stack[sp]); /* the lower half is searched first */
++            stack[sp + 1].val = vlo;
++            stack[sp].val = vhi;
+             sp += 2;
+         }
+     }
+@@ -381,15 +567,17 @@ static int expand_top(double *largest) {
+     add_node(&root);
+     while (head < ntree && ntree - head < presplit) {
+         int id = head++, k;
+-        double value;
++        double value, vlo, vhi;
+         Box lower, upper;
+-        k = evaluate(&tree[id].box, work[0], &value);
++        k = evaluate(&tree[id].box, work[0], &value, &vlo, &vhi);
+         tree[id].kind = k;
+         if (k == LEAF) {
+             if (value > *largest) *largest = value;
+             continue;
+         }
+         bisect(&tree[id].box, k, &lower, &upper);
++        lower.val = vlo;
++        upper.val = vhi;
+         tree[id].child = add_node(&lower);
+         add_node(&upper);
+     }
+@@ -470,6 +658,7 @@ static void read_input(const char *path) {
+         exit(1);
+     }
+     root.depth = 0;
++    root.val = -1;
+ }
+ 
+ /* a whole-number command-line argument */
+@@ -504,12 +693,107 @@ int main(int argc, char **argv) {
+     for (int a = 3; a + 1 < argc; a += 2) {
+         if (!strcmp(argv[a], "-c"))
+             centre_depth = (int)parse_number(argv[a + 1]);
++        else if (!strcmp(argv[a], "-s"))
++            split_mode = (int)parse_number(argv[a + 1]);
++        else if (!strcmp(argv[a], "-b"))
++            use_b2 = (int)parse_number(argv[a + 1]);
++        else if (!strcmp(argv[a], "-g"))
++            b2_gate = atof(argv[a + 1]);
++        else if (!strcmp(argv[a], "-m"))
++            nsub = (int)parse_number(argv[a + 1]);
++        else if (!strcmp(argv[a], "-r"))
++            min_ratio = atof(argv[a + 1]);
+         else if (!strcmp(argv[a], "-n"))
+             max_nodes = parse_number(argv[a + 1]);
+         else
+             die("usage: csearch input.txt cert.txt [-c depth] [-n max_nodes]");
+     }
+     make_window();
++    if (getenv("SOUND")) {
++        /* soundness test: random boxes; the bound must be >= the area at every sampled point */
++        Workspace *ws = malloc(sizeof(Workspace));
++        Work2 *w2 = malloc(sizeof(Work2));
++        double wc[2 * MAXK], lo[2 * MAXK], hi[2 * MAXK], pt[2 * MAXK], tot, worst = 1e9;
++        double opt[8] = {2.340708, -1.218559, 1.793207, -1.674980, 2.340708, -1.218559, 1.793207, -1.674980};
++        long viol = 0, tested = 0;
++        srand(atoi(getenv("SOUND")));
++        for (int trial = 0; trial < 3000; trial++) {
++            double scale = pow(10, -3.5 + 3.3 * rand() / (double)RAND_MAX);
++            for (int i = 0; i < 2 * K; i++) {
++                double r = rand() / (double)RAND_MAX, hw = scale * (0.2 + rand() / (double)RAND_MAX);
++                wc[i] = trial % 3 ? opt[i % 8] + (r - 0.5) * 0.3 : root.lo[i] + r * (root.hi[i] - root.lo[i]);
++                lo[i] = wc[i] - hw;
++                hi[i] = wc[i] + hw;
++            }
++            double b = bound2(lo, hi, w2), mx = 0;
++            if (b > 1e299) continue;
++            tested++;
++            for (int s = 0; s < 400; s++) {
++                for (int i = 0; i < 2 * K; i++) {
++                    double r = rand() / (double)RAND_MAX;
++                    if (s % 2) r = r < 0.5 ? 0 : 1;
++                    pt[i] = lo[i] + r * (hi[i] - lo[i]);
++                }
++                /* total area at the point = Gamma's total with lo = hi = pt */
++                gamma_box(pt, pt, &tot, ws);
++                if (tot > mx) mx = tot;
++            }
++            /* hill-climb from the best sample: coordinate moves to the box ends and back */
++            {
++                double cur[2 * MAXK], bestv = -1;
++                for (int s = 0; s < 400; s++) {
++                    for (int i = 0; i < 2 * K; i++) pt[i] = lo[i] + (rand() / (double)RAND_MAX) * (hi[i] - lo[i]);
++                    gamma_box(pt, pt, &tot, ws);
++                    if (tot > bestv) { bestv = tot; memcpy(cur, pt, sizeof cur); }
++                }
++                for (int it = 0; it < 30; it++)
++                    for (int i = 0; i < 2 * K; i++)
++                        for (int q = 0; q <= 8; q++) {
++                            double keep = cur[i];
++                            cur[i] = lo[i] + q * (hi[i] - lo[i]) / 8;
++                            gamma_box(cur, cur, &tot, ws);
++                            if (tot > bestv) bestv = tot; else cur[i] = keep;
++                        }
++                if (bestv > mx) mx = bestv;
++            }
++            if (mx > 1.5 && b - mx < worst) worst = b - mx;
++            if (mx > b + 1e-9) {
++                viol++;
++                if (viol < 5) printf("VIOLATION trial %d: bound %.9f < sampled %.9f (scale %.2e)\n", trial, b, mx, scale);
++            }
++        }
++        printf("tested %ld boxes, violations %ld, min slack (boxes with area > 1.5) %.3e\n", tested, viol, worst);
++        return 0;
++    }
++    if (getenv("DIAG")) {
++        /* DIAG="w1 ... w2k": print Gamma, bound2 and the centre value for cubes of several half-widths */
++        double wc[2 * MAXK], lo[2 * MAXK], hi[2 * MAXK], tot;
++        char *p = getenv("DIAG");
++        Workspace *ws = malloc(sizeof(Workspace));
++        Work2 *w2 = malloc(sizeof(Work2));
++        for (int i = 0; i < 2 * K; i++) wc[i] = strtod(p, &p);
++        printf("centre %.9f\n", gamma_box(wc, wc, &tot, ws));
++        for (double dl = 0.064; dl > 1e-4; dl /= 2) {
++            for (int i = 0; i < 2 * K; i++) { lo[i] = wc[i] - dl; hi[i] = wc[i] + dl; }
++            double g = gamma_box(lo, hi, &tot, ws);
++            printf("halfwidth %.5f  Gamma %.6f (total %.6f)  bound2 %.6f   excess G %.5f  b2 %.5f\n", dl, g, tot,
++                   bound2(lo, hi, w2), g - 1.731723649, bound2(lo, hi, w2) - 1.731723649);
++            {
++                double best = 0, pt[2 * MAXK];
++                for (int s = 0; s < 200000; s++) {
++                    for (int i = 0; i < 2 * K; i++) {
++                        double r = rand() / (double)RAND_MAX;
++                        if (s % 2) r = r < 0.5 ? 0 : 1; /* corners too */
++                        pt[i] = lo[i] + r * (hi[i] - lo[i]);
++                    }
++                    double v = gamma_box(pt, pt, &tot, ws);
++                    if (v > best) best = v;
++                }
++                printf("      sampled sup %.6f  excess %.5f\n", best, best - 1.731723649);
++            }
++        }
++        return 0;
++    }
+     nthreads = omp_get_max_threads();
+     if (nthreads > MAXTHREADS) {
+         nthreads = MAXTHREADS;
+@@ -517,6 +801,7 @@ int main(int argc, char **argv) {
+     }
+     for (int t = 0; t < nthreads; t++) {
+         work[t] = malloc(sizeof(Workspace));
++        work2[t] = malloc(sizeof(Work2));
+         if (!work[t]) die("out of memory");
+     }
+     t0 = omp_get_wtime();
+@@ -527,7 +812,7 @@ int main(int argc, char **argv) {
+     sub = calloc((size_t)nfront + 1, sizeof(Subtree));
+     if (!sub) die("out of memory");
+ #pragma omp parallel for schedule(dynamic, 1)
+-    for (i = 0; i < nfront; i++) search_subtree(&tree[head + i].box, &sub[i], work[omp_get_thread_num()]);
++    for (i = nfront - 1; i >= 0; i--) search_subtree(&tree[head + i].box, &sub[i], work[omp_get_thread_num()]);
+     if (failed) {
+         printf("FAILED\n");
+         exit(2);
+diff --git a/search/run_search.py b/search/run_search.py
+index 6567e4b..370ac4e 100644
+--- a/search/run_search.py
++++ b/search/run_search.py
+@@ -20,7 +20,7 @@ from fractions import Fraction
+ from relaxation import Relaxation
+ 
+ MARGIN = 1e-7  # a box is a leaf if its floating-point value is at most T - MARGIN
+-PRESPLIT = 4096  # number of subtrees searched in parallel
++PRESPLIT = int(os.environ.get("PRESPLIT", "4096"))  # number of subtrees searched in parallel
+ 
+ 
+ def main(argv):
+@@ -45,7 +45,7 @@ def main(argv):
+     with open(f"certs/in_{name}.txt", "w") as fh:
+         fh.write("\n".join(lines) + "\n")
+ 
+-    program = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csearch")
++    program = os.environ.get("CSEARCH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "csearch"))
+     env = dict(os.environ, OMP_NUM_THREADS=os.environ.get("OMP_NUM_THREADS", "4"))
+     command = [program, f"certs/in_{name}.txt", f"certs/cert_{name}.txt", *options]
+     result = subprocess.run(command, capture_output=True, text=True, env=env, check=False)

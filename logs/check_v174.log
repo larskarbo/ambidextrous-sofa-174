@@ -1,0 +1,12 @@
+spec specs/v174.json: 4 hallways, W=5/1 (min W_a=60/12 = 5.000000), T=87/50 = 1.740000000
+  hallway 0: h=5  h*f = 0 + 4 x + 3 y ;  h*g = 0 + -3 x + 4 y
+  hallway 1: h=5  h*f = 0 + 3 x + 4 y ;  h*g = 0 + -4 x + 3 y
+  hallway 2: h=5  h*f = 3 + 4 x + -3 y ;  h*g = 4 + -3 x + -4 y
+  hallway 3: h=5  h*f = 4 + 3 x + -4 y ;  h*g = 3 + -4 x + -3 y
+cert certs/cert_v174.txt: 165428193 tokens (0.5s)
+structure: complete binary tree, 165428193 tokens, 82714097 leaves, max depth 68, max per-coordinate depth 9
+scale: Dk=9 M=8192 L=4200 (12 directions)
+tasks: 11985 (cut depth 20), setup 1.0s
+leaves checked 82714097 (tokens say 82714097) ; worst certified leaf value 1.7400000000 ; leaves exceeding T: 0 ; leaves needing components: 77116987 ; wall 1030.1s cpu 3554.2s
+telescoping bound: nsub=8, leaves certified by it: 76434160
+CERTIFICATE VALID
