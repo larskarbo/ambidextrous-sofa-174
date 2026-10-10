@@ -2,6 +2,25 @@
 
 A computer-assisted proof that **every ambidextrous sofa has area at most 1.74**. The previous best upper bound was 1.765.
 
+## In plain words
+
+<p align="center"><img src="figures/hallway.svg" alt="A unit-width hallway that ends in a corner, where it can turn left or right" width="520"></p>
+
+- **The hallway.** Take a hallway exactly 1 unit wide (say 1 metre) with a 90° corner at the end.
+- **The sofa.** It is any flat, rigid shape that you slide along the floor. You may rotate it and wiggle it, but you may not lift or bend it.
+- **Ambidextrous.** The *same* shape, from the *same* starting spot, must be able to get around the corner whether it turns left or right.
+- **The question.** What is the largest area such a shape can have? With a 1 m hallway, the area is in m².
+
+<p align="center"><img src="figures/bounds.svg" alt="Number line: best sofa found 1.645, new proven ceiling 1.74, old ceiling 1.765" width="600"></p>
+
+- **1.645**: someone found a specific shape this big that works, so the answer is *at least* 1.645.
+- **1.74**: this repo proves that *no* shape larger than this can work, whatever its form, so the answer is *at most* 1.74.
+- **Unknown**: the true answer lies somewhere in between, and nobody knows where. Before this work, the proven ceiling was 1.765.
+
+This result did not find a better sofa. It proves that bigger sofas are impossible. For comparison, a 1×1 square fits around the corner both ways, so the answer is at least 1. The ordinary one-way version of the problem (the classic moving sofa problem) was settled only recently, after about 60 years: its answer is ≈ 2.2195.
+
+## The numbers
+
 | | Value | Source |
 |---|---|---|
 | Lower bound | 1.64495521… | Romik (2018) |
